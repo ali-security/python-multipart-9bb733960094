@@ -1535,6 +1535,15 @@ class TestHelperFunctions(unittest.TestCase):
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0].size, 10)
 
+    def test_parse_form_negative_content_length(self):
+        with self.assertRaisesRegex(ValueError, "Content-Length must be non-negative"):
+            parse_form(
+                {"Content-Type": b"application/octet-stream", "Content-Length": b"-1"},
+                BytesIO(b"123456789012345"),
+                lambda _: None,
+                lambda _: None,
+            )
+
 
 def suite():
     suite = unittest.TestSuite()

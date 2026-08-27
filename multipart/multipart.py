@@ -1977,6 +1977,8 @@ def parse_form(headers, input_stream, on_field, on_file, chunk_size=1048576, **k
     content_length = headers.get("Content-Length")
     if content_length is not None:
         content_length = int(content_length)
+        if content_length < 0:
+            raise ValueError("Content-Length must be non-negative")
     else:
         content_length = float("inf")
     bytes_read = 0
