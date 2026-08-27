@@ -1031,6 +1031,46 @@ class TestFormParser(unittest.TestCase):
         with self.assertRaises(MultipartParseError):
             i = self.f.write(data)
 
+    def test_multipart_header_count_limit(self):
+        self.make("poc")
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"\r\n' + (b"X-A: 1\r\n" * 8)
+        with self.assertRaisesRegex(MultipartParseError, "Maximum header count exceeded"):
+            self.f.write(payload)
+
+    def test_multipart_header_size_limit(self):
+        self.make("poc")
+        payload = b'--poc\r\nContent-Disposition: form-data; name="x"\r\n' + b"X-A: " + (b"a" * (4096 + 124))
+        with self.assertRaisesRegex(MultipartParseError, "Maximum header size exceeded"):
+            self.f.write(payload)
+
+    def test_multipart_header_limits_reset_between_parts(self):
+        # The per-part limits must reset on every part, while still being
+        # tracked across the chunk boundaries of successive write() calls.
+        self.make("boundary")
+
+        long_value = b"a" * 4000
+        data = b""
+        for i in range(5):
+            data += (
+                b"--boundary\r\n"
+                + (b'Content-Disposition: form-data; name="field%d"\r\n' % i)
+                + b"Content-Type: text/plain\r\n"
+                + b"X-Long: "
+                + long_value
+                + b"\r\n"
+                + b"\r\n"
+                + (b"value%d\r\n" % i)
+            )
+        data += b"--boundary--\r\n"
+
+        # Feed in small chunks, so that a single header line spans several writes.
+        for start in range(0, len(data), 512):
+            self.f.write(data[start : start + 512])
+        self.f.finalize()
+
+        for i in range(5):
+            self.assert_field(b"field%d" % i, b"value%d" % i)
+
     def test_octet_stream(self):
         files = []
 
