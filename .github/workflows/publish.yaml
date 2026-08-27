@@ -9,9 +9,7 @@
 name: Upload Python Package
 
 on:
-  push:
-    tags:
-      - '*'
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -19,6 +17,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
     - uses: actions/checkout@v4
@@ -28,15 +27,21 @@ jobs:
         python-version: "3.10"
 
     - name: Install dependencies
+      env:
+        PIP_INDEX_URL: "https://:2024-02-10@time-machines-pypi.sealsecurity.io/"
       run: |
         python -m pip install --upgrade pip
-        pip install build
+        # The released wheel's WHEEL Generator is hatchling 1.21.1; a default
+        # isolated build would install whatever hatchling is newest and change
+        # that line, so pin it and build against it directly.
+        pip install build hatchling==1.21.1
 
     - name: Build package
-      run: python -m build
+      run: python -m build --no-isolation
 
-    - name: Publish package
-      uses: pypa/gh-action-pypi-publish@v1.8.11
+    - name: Upload distributions
+      uses: actions/upload-artifact@v4
       with:
-        user: __token__
-        password: ${{ secrets.PYPI_API_TOKEN }}
+        name: dist
+        path: dist/*
+        if-no-files-found: error
