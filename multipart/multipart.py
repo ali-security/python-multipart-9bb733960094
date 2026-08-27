@@ -1156,7 +1156,11 @@ class MultipartParser(BaseParser):
             if state == MultipartState.START:
                 # Skip leading newlines
                 if c == CR or c == LF:
-                    i += 1
+                    i = data.find(b"-", i)
+                    if i == -1:
+                        # No boundary candidate in this chunk, so ignore the content after the leading CR/LF.
+                        i = length
+                        break
                     continue
 
                 # index is used as in index into our boundary.  Set to 0.
@@ -1458,12 +1462,8 @@ class MultipartParser(BaseParser):
                     i -= 1
 
             elif state == MultipartState.END:
-                # Don't do anything if chunk ends with CRLF.
-                if c == CR and i + 1 < length and data[i + 1] == LF:
-                    i += 2
-                    continue
-                # Skip data after the last boundary.
-                self.logger.warning("Skipping data after last boundary")
+                # Silently discard any epilogue data (RFC 2046 section 5.1.1 allows a CRLF and optional
+                # epilogue after the closing boundary). Django and Werkzeug do the same.
                 i = length
                 break
 

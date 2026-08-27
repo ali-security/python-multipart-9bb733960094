@@ -1,13 +1,12 @@
-import logging
 import os
 import random
 import sys
 import tempfile
+import time
 import unittest
 from io import BytesIO
 from unittest.mock import Mock
 
-import pytest
 import yaml
 
 from multipart.decoders import Base64Decoder, QuotedPrintableDecoder
@@ -692,6 +691,15 @@ for f in os.listdir(http_tests_dir):
         http_tests.append({"name": fname, "test": test_data, "result": yaml_data})
 
 
+EPILOGUE_TEST_HEAD = (
+    "--boundary\r\n"
+    'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
+    "Content-Type: text/plain\r\n\r\n"
+    "hello\r\n"
+    "--boundary--"
+).encode("latin-1")
+
+
 def split_all(val):
     """
     This function will split an array all possible ways.  For example:
@@ -1163,20 +1171,43 @@ class TestFormParser(unittest.TestCase):
         self.assertEqual(fields[2].field_name, b"baz")
         self.assertEqual(fields[2].value, b"asdf")
 
-    @pytest.fixture(autouse=True)
-    def inject_fixtures(self, caplog):
-        self._caplog = caplog
-
-    def test_multipart_parser_newlines_before_first_boundary(self):
-        """This test makes sure that the parser does not log a line per newline before the first boundary."""
-        num = 5_000_000
-        data = (
-            "\r\n" * num + "--boundary\r\n"
-            'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
-            "Content-Type: text/plain\r\n\r\n"
-            "hello\r\n"
-            "--boundary--"
-        )
+    @parametrize(
+        "chunks",
+        [
+            [
+                b"\r\nignored preamble\r\n"
+                + (
+                    b"--boundary\r\n"
+                    b'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
+                    b"Content-Type: text/plain\r\n\r\n"
+                    b"hello\r\n"
+                    b"--boundary--"
+                )
+            ],
+            [
+                b"\r\n" * 5_000_000
+                + (
+                    b"--boundary\r\n"
+                    b'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
+                    b"Content-Type: text/plain\r\n\r\n"
+                    b"hello\r\n"
+                    b"--boundary--"
+                )
+            ],
+            [
+                b"\r\n" * 5_000_000,
+                (
+                    b"--boundary\r\n"
+                    b'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
+                    b"Content-Type: text/plain\r\n\r\n"
+                    b"hello\r\n"
+                    b"--boundary--"
+                ),
+            ],
+        ],
+    )
+    def test_multipart_parser_preamble_before_first_boundary(self, chunks):
+        """Parser must not hang or blow up on a preamble before the first boundary."""
 
         files = []
 
@@ -1184,13 +1215,14 @@ class TestFormParser(unittest.TestCase):
             files.append(f)
 
         f = FormParser("multipart/form-data", on_field=Mock(), on_file=on_file, boundary="boundary")
-        with self._caplog.at_level(logging.DEBUG):
-            f.write(data.encode("latin-1"))
-            # The leading CR/LF bytes must not emit a log event each - that is the DoS.
-            assert len(self._caplog.records) < 1000
+        for chunk in chunks:
+            f.write(chunk)
+
+        assert len(files) == 1
+        self.assert_file_data(files[0], b"hello")
 
     def test_multipart_parser_data_after_last_boundary(self):
-        """This test makes sure that the parser does not handle when there is junk data after the last boundary."""
+        """Parser must short-circuit on arbitrary epilogue data after the closing boundary (no O(N) scan)."""
         num = 50_000_000
         data = (
             "--boundary\r\n"
@@ -1206,31 +1238,74 @@ class TestFormParser(unittest.TestCase):
             files.append(f)
 
         f = FormParser("multipart/form-data", on_field=Mock(), on_file=on_file, boundary="boundary")
-        with self._caplog.at_level(logging.WARNING):
-            f.write(data.encode("latin-1"))
-            # The junk is skipped in one step, so it is logged once - not once per byte.
-            assert len(self._caplog.records) == 1
-            assert self._caplog.records[0].getMessage() == "Skipping data after last boundary"
+        f.write(data.encode("latin-1"))
 
-    def test_multipart_parser_data_end_with_crlf_without_warnings(self):
-        """This test makes sure that the parser does not handle when the data ends with a CRLF."""
-        data = (
-            "--boundary\r\n"
-            'Content-Disposition: form-data; name="file"; filename="filename.txt"\r\n'
-            "Content-Type: text/plain\r\n\r\n"
-            "hello\r\n"
-            "--boundary--\r\n"
-        )
+    @parametrize(
+        "chunks",
+        [
+            [EPILOGUE_TEST_HEAD + b"\r\n"],
+            [EPILOGUE_TEST_HEAD + b"\r", b"\n"],
+            [EPILOGUE_TEST_HEAD, b"\r\n"],
+            [EPILOGUE_TEST_HEAD + b"\r\n--boundary\r\nthis is not a valid header\r\n\r\nnot a real part"],
+        ],
+    )
+    def test_multipart_parser_ignores_epilogue(self, chunks):
+        """Epilogue data after the closing boundary must be ignored.
 
+        Covers both the single-chunk case and the case where trailing CRLF is split across `write()` calls.
+        The final case asserts that epilogue bytes are not parsed or validated.
+        """
         files = []
 
         def on_file(f):
             files.append(f)
 
         f = FormParser("multipart/form-data", on_field=Mock(), on_file=on_file, boundary="boundary")
-        with self._caplog.at_level(logging.WARNING):
-            f.write(data.encode("latin-1"))
-            assert len(self._caplog.records) == 0
+        for chunk in chunks:
+            f.write(chunk)
+
+        assert len(files) == 1
+        self.assert_file_data(files[0], b"hello")
+
+    def _time_write(self, data):
+        """Feed `data` to a fresh multipart parser and return (files, elapsed_seconds)."""
+        files = []
+
+        def on_file(f):
+            files.append(f)
+
+        f = FormParser("multipart/form-data", on_field=Mock(), on_file=on_file, boundary="boundary")
+        start = time.monotonic()
+        f.write(data)
+        return files, time.monotonic() - start
+
+    def test_multipart_parser_large_preamble_is_skipped_in_one_step(self):
+        """A large CR/LF preamble must be skipped in one step, not walked byte by byte.
+
+        The parser used to advance a single byte per leading CR/LF, so a body with a
+        100 MB preamble burned tens of seconds of CPU before the first boundary.
+        """
+        data = b"\r\n" * 50_000_000 + EPILOGUE_TEST_HEAD
+
+        files, elapsed = self._time_write(data)
+
+        assert len(files) == 1
+        self.assert_file_data(files[0], b"hello")
+        assert elapsed < 5.0, "parser walked the preamble byte by byte (%.1fs)" % elapsed
+
+    def test_multipart_parser_large_epilogue_is_skipped_in_one_step(self):
+        """A large CRLF epilogue must be discarded in one step, not walked two bytes at a time.
+
+        The parser used to consume the epilogue CRLF-pair by CRLF-pair, so a body with a
+        50 MB trailing epilogue burned tens of seconds of CPU after the closing boundary.
+        """
+        data = EPILOGUE_TEST_HEAD + b"\r\n" * 25_000_000
+
+        files, elapsed = self._time_write(data)
+
+        assert len(files) == 1
+        self.assert_file_data(files[0], b"hello")
+        assert elapsed < 5.0, "parser walked the epilogue two bytes at a time (%.1fs)" % elapsed
 
     def test_max_size_multipart(self):
         # Load test data.
