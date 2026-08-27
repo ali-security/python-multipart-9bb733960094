@@ -381,10 +381,48 @@ class TestQuerystringParser(unittest.TestCase):
         self.p.write(b"f=baz")
         self.assert_fields((b"asdf", b"baz"))
 
-    def test_semicolon_separator(self):
-        self.p.write(b"foo=bar;asdf=baz")
+    def test_semicolon_is_data_not_a_field_separator(self):
+        """Only `&` separates fields, as the WHATWG URL standard requires.
 
-        self.assert_fields((b"foo", b"bar"), (b"asdf", b"baz"))
+        Treating `;` as a separator lets a request smuggle a parameter past an
+        upstream validator: a gateway sees `x=";role=admin"` while the parser
+        used to see a second `role=admin` field, which wins in most frameworks.
+        """
+        self.p.write(b"role=user&x=;role=admin")
+
+        self.assert_fields((b"role", b"user"), (b"x", b";role=admin"))
+
+    def test_semicolon_separated_body_parses_in_linear_time(self):
+        """A semicolon-heavy body must not cost quadratic time.
+
+        The parser used to scan the whole remaining buffer for `&` and only fall
+        back to `;` once no `&` existed ahead, so a 1 MiB body of `a=1;` pairs
+        cost O(B**2) byte comparisons - seconds of CPU for a single request.
+        """
+        data = b"a=1;" * 250_000
+
+        start = time.monotonic()
+        self.p.write(data)
+        elapsed = time.monotonic() - start
+
+        # Semicolons are data, so the body is one field whose value is the rest.
+        self.assert_fields((b"a", data[2:]))
+        assert elapsed < 5.0, "querystring parser rescanned the buffer per field (%.1fs)" % elapsed
+
+    def test_separator_search_is_bounded_by_max_size(self):
+        """The separator search must stop at the truncation boundary.
+
+        `write()` shortens the chunk to what `max_size` still allows, but the
+        separator lookup used to scan the entire buffer, so a separator sitting
+        past the budget dragged in data the size limit was meant to cut off.
+        """
+        self.p.max_size = 5
+
+        # Only b"a=123" is within the budget; the ampersand at index 6 is past
+        # it and must not be found.
+        self.p.write(b"a=1234&b=2")
+
+        self.assert_fields((b"a", b"123"))
 
     def test_too_large_field(self):
         self.p.max_size = 15
